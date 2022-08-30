@@ -1,12 +1,11 @@
 Description: create_delta_package method will create a releasePackage foleder with a subfolder force-app with all new/changed files. package.xml 
 and destructiveChangesPost.xml
 
-Assumption 1: Your target org has already been authenticated
-Assumption 2: RELEASE_BRANCH_BASE_COMMIT is the commit in current after which all further commit changes will be collected for delta package
-Assumption 3: CI_COMMIT_REF_NAME is the release branch
+Assumption 1: RELEASE_BRANCH_BASE_COMMIT is the commit in current after which all further commit changes will be collected for delta package
+Assumption 2: CI_COMMIT_REF_NAME is the release branch
 
 # Function to copy the metadata file to a different folder
-NOTE: Methods checkout_branch and delete_branch are my own methods to checkoout and delete branch respectively 
+NOTE: Methods checkout_branch, delete_branch and push_changes are my own methods to checkout branch, delete branch and push the committed changes respectively 
 
  function copy_metadata_file() {
     FILE="$1"
@@ -66,8 +65,9 @@ function create_delta_package() {
     # For each commit id in changes
     while read -r commitid
     do
-      # Get all changed and deleted files of the commit
+      # Get all changed files of the commit
       git diff-tree --no-commit-id --name-only -r --diff-filter=d -m $commitid > commitReleaseChanges.log
+      # Get all deleted files of the commit
       git diff-tree --no-commit-id --name-only -r --diff-filter=D -m $commitid > commitDeleteChanges.log
       
       # Get latest commit for each changed file
@@ -137,14 +137,14 @@ function create_delta_package() {
       if [[ -n "${releaseChangeCommit[$delFile]}" ]]; then
         del_file_commit=${releaseChangeCommit[$delFile]}
 
-        # Create a branch from the commit to fetch the metadata of deleted component
+        # Create a local branch from the commit to fetch the metadata of deleted component
         commit_branch="commitbranch_${del_file_commit}"
         git checkout -b $commit_branch $del_file_commit
 
         if [ -f "$delFile" ]; then
           del_file_exists="yes"
         fi
-      # Otherwise, it will be in base commit
+      # Otherwise, it will be in base commit. If it is not in base commit also, this file will a newly created file which will be deleted later
       else
         if [ -f "basecommitFiles/$delFile" ]; then
            del_file_exists="yes"
@@ -163,35 +163,8 @@ function create_delta_package() {
 
     # Create a packag.xml based on those metdata of deleted files
     sfdx force:source:manifest:create -p deletedFiles -n deletedFiles/package.xml --apiversion $SF_API_VERSION
-    packagexml_content=$(cat deletedFiles/package.xml)
-    # If there is at least one deleted component
-    if [[ $packagexml_content == *types* && $packagexml_content == *members* ]]; then 
-      # But we are not sure if all of those deleted files are in the target org. So, we need to check if that delete committed file is in target org
-      create_branch "destructive_changes" "main"
-      # Retrieve the netadata files of delete committed files from target org
-      sfdx force:source:retrieve -x deletedFiles/package.xml
-
-      rm -rf deletedFiles
-      mkdir -p deletedFiles
-      # Check again if the deleted committed file has been retrieved from target org
-      for delFile in ${releaseDeletions[@]} 
-      do
-        # If the delete committed file is there, it is genuine candidate of deletion
-        if [ -f "$delFile" ]; then
-          copy_metadata_file "$delFile" "deletedFiles"         
-        fi
-      done
-
-      checkout_branch $CI_COMMIT_REF_NAME
-
-      # Delete destructive changes branch
-      delete_branch "destructive_changes"
-
-      # Create the final package.xml for deleted files
-      sfdx force:source:manifest:create -p deletedFiles -n deletedFiles/package.xml --apiversion $SF_API_VERSION
-    else
-      checkout_branch $CI_COMMIT_REF_NAME
-    fi
+    
+    checkout_branch $CI_COMMIT_REF_NAME
     
     mkdir -p releasePackage
 
@@ -202,8 +175,11 @@ function create_delta_package() {
     touch releasePackage/destructiveChangesPost.xml
     cp deletedFiles/package.xml releasePackage/destructiveChangesPost.xml
     rm -rf deletedFiles
+    
+    git commit -m "Creted delta package for deployment"
+    push_changes $CI_COMMIT_REF_NAME
 
-    # Remove the commit branches
+    # Remove the temporary local commit branches
     for commit_branch in ${commit_branches[@]} 
     do
       git branch -D $commit_branch > delbranch.log
