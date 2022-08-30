@@ -1,0 +1,212 @@
+Description: create_delta_package method will create a releasePackage foleder with a subfolder force-app with all new/changed files. package.xml 
+and destructiveChangesPost.xml
+
+Assumption 1: Your target org has already been authenticated
+Assumption 2: RELEASE_BRANCH_BASE_COMMIT is the commit in current after which all further commit changes will be collected for delta package
+Assumption 3: CI_COMMIT_REF_NAME is the release branch
+
+# Function to copy the metadata file to a different folder
+NOTE: Methods checkout_branch and delete_branch are my own methods to checkoout and delete branch respectively 
+
+ function copy_metadata_file() {
+    FILE="$1"
+    target_parent_folder=$2
+
+    dir="$(dirname "${FILE}")"
+    mkdir -p "${target_parent_folder}/${dir}"
+    touch "${target_parent_folder}/${FILE}"
+    cp "$FILE" "${target_parent_folder}/${FILE}"
+    
+    # If the files has -meta.xml, check if there will be any source file for that component
+    if [[ $FILE =~ -meta.xml ]]; then
+      find="-meta.xml"
+      replace=""
+      src_file=${FILE/${find}/${replace}}
+
+      if [ -f "$src_file" ]; then
+        touch "${target_parent_folder}/${src_file}"
+        cp "$src_file" "${target_parent_folder}/${src_file}"
+      fi
+    # Otherwise, if it is a source file, check if meta xml file is there
+    elif [ -f "$FILE-meta.xml" ]; then
+      meta_xml_file="$FILE-meta.xml"
+      touch "${target_parent_folder}/${meta_xml_file}"
+      cp "$meta_xml_file" "${target_parent_folder}/${meta_xml_file}"
+    fi     
+  }
+
+function create_delta_package() {
+    # Base commit of the release branch
+    echo "base commit id => $RELEASE_BRANCH_BASE_COMMIT"
+    
+    # Get the last commit of the release branch. 
+    latest_commit=$(git log -n 1 origin/$CI_COMMIT_REF_NAME --pretty=format:"%H")
+    echo "last commit id => $latest_commit"
+
+    # Create a temporary branch from base commit of the release branch. 
+    base_commit_branch="commitbranch_${RELEASE_BRANCH_BASE_COMMIT}"
+    git checkout -b $base_commit_branch $RELEASE_BRANCH_BASE_COMMIT
+
+    # Copy the force-app folder of base commit branch. This is used later for checking if there will be any changes between final version in branch and 
+    # that in the base commit
+    rm -rf basecommitFiles
+    mkdir -p basecommitFiles
+    cp -r force-app basecommitFiles
+
+    checkout_branch $CI_COMMIT_REF_NAME
+
+    # Declare an associative array to hold a changed file and the latest commit in which that file has been changed.
+    declare -A releaseChangeCommit
+    # Declare an array to hold the deleted file names
+    declare releaseDeletions=()
+
+    # Get all the commit ids in the orginal branch between base commit and last commit ie, all your release changes
+    git log --reverse --ancestry-path --format=%H $RELEASE_BRANCH_BASE_COMMIT..$latest_commit > allCommits.log
+
+    # For each commit id in changes
+    while read -r commitid
+    do
+      # Get all changed and deleted files of the commit
+      git diff-tree --no-commit-id --name-only -r --diff-filter=d -m $commitid > commitReleaseChanges.log
+      git diff-tree --no-commit-id --name-only -r --diff-filter=D -m $commitid > commitDeleteChanges.log
+      
+      # Get latest commit for each changed file
+      while read -r FILE
+      do
+        # Need to tak only changed metadata files
+        if [[ $FILE != *force-app/main/default* ]]; then
+          continue
+        fi
+         # Set the commit id for the changed file
+        releaseChangeCommit[$FILE]=$commitid
+      done < commitReleaseChanges.log
+      rm commitReleaseChanges.log
+
+      # Collect all deleted files
+      while read -r FILE
+      do
+        # If the file is in release branch, it is definitely not a deleted file
+        # If the deleted file is not a metadata file, we should not take that
+        if [[ -f "$FILE" || $FILE != *force-app/main/default* ]]; then
+          continue
+        fi
+        releaseDeletions+=($FILE)
+      done < commitDeleteChanges.log
+      rm commitDeleteChanges.log
+    done < allCommits.log
+    rm allCommits.log
+    
+    # Create a folder for storing old metadata file of changed files
+    rm -rf changedFiles
+    mkdir -p changedFiles
+    
+    # If each changed file is in release branch and it has some difference from base commit version, it is a genuine change
+    for FILE in "${!releaseChangeCommit[@]}"
+    do
+      # If file is in release branch
+      if [ -f "$FILE" ]; then
+        # Check if there is a change between release branch version and base commit version
+        git diff --output=filechange.log $CI_COMMIT_REF_NAME..$base_commit_branch "$FILE"
+        # If there is a change, copy the file to changedFiles folder
+        if [ -s filechange.log ]; then
+          copy_metadata_file "$FILE" "changedFiles"
+        fi
+        rm filechange.log
+      fi
+    done
+
+    # Create a packag.xml based on metdata of changed files
+    sfdx force:source:manifest:create -p changedFiles -n changedFiles/package.xml --apiversion $SF_API_VERSION
+    
+    # Remove the temporary base commit branch
+    git branch -D $base_commit_branch > delbranch.log
+    rm delbranch.log
+
+    # Create a folder for old metadata file of deleted files
+    rm -rf deletedFiles
+    mkdir -p deletedFiles
+     
+    # Declare an array to store the names of commit branches
+    declare commit_branches=()
+
+    # For each deleted file, get a valid commit id to fetch its metadata
+    for delFile in ${releaseDeletions[@]} 
+    do
+      del_file_exists="no"
+      # If the deleted file has previously changed in a commit, get that commit id
+      if [[ -n "${releaseChangeCommit[$delFile]}" ]]; then
+        del_file_commit=${releaseChangeCommit[$delFile]}
+
+        # Create a branch from the commit to fetch the metadata of deleted component
+        commit_branch="commitbranch_${del_file_commit}"
+        git checkout -b $commit_branch $del_file_commit
+
+        if [ -f "$delFile" ]; then
+          del_file_exists="yes"
+        fi
+      # Otherwise, it will be in base commit
+      else
+        if [ -f "basecommitFiles/$delFile" ]; then
+           del_file_exists="yes"
+        fi
+      fi
+
+      # Copy the deleted file metadata to deletedFiles folder
+      if [ del_file_exists == "yes" ]; then
+        copy_metadata_file "$delFile" "deletedFiles"
+      fi
+
+      commit_branches+=($commit_branch)
+    done
+
+    rm -rf basecommitFiles
+
+    # Create a packag.xml based on those metdata of deleted files
+    sfdx force:source:manifest:create -p deletedFiles -n deletedFiles/package.xml --apiversion $SF_API_VERSION
+    packagexml_content=$(cat deletedFiles/package.xml)
+    # If there is at least one deleted component
+    if [[ $packagexml_content == *types* && $packagexml_content == *members* ]]; then 
+      # But we are not sure if all of those deleted files are in the target org. So, we need to check if that delete committed file is in target org
+      create_branch "destructive_changes" "main"
+      # Retrieve the netadata files of delete committed files from target org
+      sfdx force:source:retrieve -x deletedFiles/package.xml
+
+      rm -rf deletedFiles
+      mkdir -p deletedFiles
+      # Check again if the deleted committed file has been retrieved from target org
+      for delFile in ${releaseDeletions[@]} 
+      do
+        # If the delete committed file is there, it is genuine candidate of deletion
+        if [ -f "$delFile" ]; then
+          copy_metadata_file "$delFile" "deletedFiles"         
+        fi
+      done
+
+      checkout_branch $CI_COMMIT_REF_NAME
+
+      # Delete destructive changes branch
+      delete_branch "destructive_changes"
+
+      # Create the final package.xml for deleted files
+      sfdx force:source:manifest:create -p deletedFiles -n deletedFiles/package.xml --apiversion $SF_API_VERSION
+    else
+      checkout_branch $CI_COMMIT_REF_NAME
+    fi
+    
+    mkdir -p releasePackage
+
+    # Copy package.xml and changed files to releasePackage folder
+    cp -r ./changedFiles/. releasePackage
+    rm -rf changedFiles
+
+    touch releasePackage/destructiveChangesPost.xml
+    cp deletedFiles/package.xml releasePackage/destructiveChangesPost.xml
+    rm -rf deletedFiles
+
+    # Remove the commit branches
+    for commit_branch in ${commit_branches[@]} 
+    do
+      git branch -D $commit_branch > delbranch.log
+      rm delbranch.log
+    done
+  }   
