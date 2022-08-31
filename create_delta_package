@@ -31,7 +31,12 @@ NOTE: Methods checkout_branch, delete_branch and push_changes are my own methods
       meta_xml_file="$FILE-meta.xml"
       touch "${target_parent_folder}/${meta_xml_file}"
       cp "$meta_xml_file" "${target_parent_folder}/${meta_xml_file}"
-    fi     
+    fi   
+    
+    # For aura and lwc, all files in the folder need to be copied for
+    if [[ $FILE == *default/lwc/* || $FILE == *default/aura/* ]]; then
+      cp -r "./$dir/." "./${target_parent_folder}/${dir}"
+    fi
   }
 
 function create_delta_package() {
