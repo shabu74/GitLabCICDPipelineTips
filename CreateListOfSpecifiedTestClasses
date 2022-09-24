@@ -1,0 +1,128 @@
+  #########################################################################################################################################################################################################################################
+  # Script to find the test classes related to changed apex classes and added it to list of specified tests
+  # Developed by: Shabu Thomas
+
+  # Global associative arrays (hashmaps)
+  declare -A referencedclasses
+  declare -A allapexclasses
+  declare -A alltestclasses
+  declare -A changedclasses
+
+  #########################################################################################################################################################################################################################################
+  # Function to set the specific test methods in repository
+    # param 1 - Name of delta package folder
+  # Developed by: Shabu Thomas
+
+  function set_sepcific_testclasses_in_repo() {
+    echo_method_header_footer "set_sepcific_testclasses_in_repo" "Creating a text file with name of test classes related to updated apex classes..." "entry"
+
+    find_all_specific_test_methods $1
+    # Convert the list of test classes to comma-separated string
+    temp="${!alltestclasses[@]}"
+    testclasslist=${temp//[ ]/,}
+    # Created RunSpecifiedTests.txt and write the comma-separated test classes in it
+    touch RunSpecifiedTests.txt
+    echo "$testclasslist" > RunSpecifiedTests.txt
+
+    echo_method_header_footer "set_sepcific_testclasses_in_repo" "Successfully created a text file with name of test classes related to updated apex classes." "exit"
+  }
+
+  #########################################################################################################################################################################################################################################
+  # Function to get the specific test methods related to changed apex classes
+   # param 1 - Name of delta package folder
+  # Developed by: Shabu Thomas
+
+  function find_all_specific_test_methods() {
+    echo_method_comment "Fetching name of apex classes changed..."
+
+    # Collect the name of all changed apex classes from delta package folder
+    if [[ -d $1/force-app/main/default/classes ]]; then
+      find ./$1/force-app/main/default/classes -name "*.cls" > packageapexclasses.log
+
+      while read -r FILE
+      do
+        FILENAME=$(get_filename $FILE)
+        filecontent=$(cat ${FILE})
+        # If the changed class itself is a test class
+        if [[ $filecontent == *@[Ii]s[Tt]est* || $filecontent == *[Tt]est[Mm]ethod* ]]; then 
+          # Add it to list of test classes
+          alltestclasses[$FILENAME]=$FILENAME
+        fi
+        # Add it for checking test class
+        changedclasses[$FILENAME]=$FILENAME
+      done < packageapexclasses.log
+      rm  packageapexclasses.log
+    fi
+
+    echo_method_comment "Fetching body of all apex classes..."
+    # Collect the body of all the apex class files in the project class folder
+    find ./force-app/main/default/classes -name "*.cls" > mainapexclasses.log
+
+    while read -r FILE
+    do
+      FILENAME=$(get_filename $FILE)
+      filecontent=$(cat ${FILE})
+      allapexclasses[$FILENAME]=$filecontent
+    done < mainapexclasses.log
+    rm mainapexclasses.log
+    
+    echo_method_comment "Finding test classes related to changed apex classes..."
+    # For each changed class, find the related test class
+    for i in "${!changedclasses[@]}"
+    do
+      find_test_methods $i
+    done
+
+    echo_method_comment "Specified Test Classes - ${!alltestclasses[*]}"
+  }
+
+  #########################################################################################################################################################################################################################################
+  # Function to get file name from the full path
+  # Developed by: Shabu Thomas
+
+  function get_filename() {
+    FILE=$1
+    BASENAME="${FILE%.[^.]*}"
+    DIRNAME="${BASENAME%/[^/]*}"
+    FILENAME="${BASENAME:${#DIRNAME} + 1}"
+    echo "$FILENAME"
+  }
+
+  #########################################################################################################################################################################################################################################
+  # Function to recursively find the test class which uses a changed apex class or a parent class which uses the changed class
+  # Developed by: Shabu Thomas
+  
+  function find_test_methods() {
+    echo_method_comment "Finding test class related to $1..."
+
+    # If the referenced class has not been previously checked for test class  
+    if [[ ! -n "${referencedclasses[$1]}" ]]; then
+      # Set this class as checked 
+      referencedclasses[$1]=$1
+      # For each apex class in the project folder
+      for i in "${!allapexclasses[@]}"
+      do
+        # If it is a different apex class
+        if [ "$1" != "$i" ]; then
+          local classbody=${allapexclasses[$i]}
+          # If the class uses the referenced class
+          if [[ $classbody == *"$1"* ]]; then
+            # If the class is a test class
+            if [[ $classbody == *@[Ii]s[Tt]est* || $classbody == *[Tt]est[Mm]ethod* ]]; then 
+              echo_method_comment "$i is a test class for $1"
+              alltestclasses[$i]=$i
+            # If the class is not test class which uses referenced class, we need to check if this class is being used by any test class
+            else
+              echo_method_comment "$i invokes the methods in $1. So we need to check if any test class uses $i"
+              # Set this class a referenced class and check for any test class for this class
+              find_test_methods $i
+            fi
+          fi
+        fi
+      done
+    # If the reference class has already been checked for test classes
+    else
+      echo_method_comment "Since ${referencedclasses[$1]} is already checked for reference in test class, we can skip it."
+    fi
+  }
+#########################################################################################################################################################################################################################################
